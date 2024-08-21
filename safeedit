@@ -1,0 +1,152 @@
+#!/usr/bin/env zsh
+
+# Date Created: 2023-08-04
+# Description: In-place file editing with temporary on-disk backup.
+
+# The text editing program to be invoked.
+readonly se_editor_prog=${se_editor_prog:-${VISUAL:-${EDITOR:-vi}}}
+
+# Command to be invoked for running as root.
+readonly sudo_prog=${sudo_prog:-sudo}
+
+# If no filename is supplied, just open the editor and call it a day.
+if [[ -z $1 ]]; then
+	echo "Opening editor: ${se_editor_prog}"
+	${se_editor_prog}
+	exit 0
+fi
+
+# Get the absolute path of the target location to work with.
+# If it resides in a non-readable directory, we have to become root.
+if [[ -r "$(dirname -- $1)" ]]; then
+	target_file="$(realpath -- $1)"
+else
+	target_file="$(${sudo_prog} realpath -- $1)"
+fi
+readonly target_file
+[[ -n ${target_file} ]] || exit 1
+
+# If the target is a (readable) directory or a nonexistent file
+# within a writable directory, just launch the editor on it directly.
+if [[ -d ${target_file} \
+	|| (! -e ${target_file} && -w "$(dirname -- ${target_file})") ]]
+then
+	echo "Opening editor: ${se_editor_prog}"
+	${se_editor_prog} -- ${target_file}
+	exit 0
+fi
+
+readonly backup_file=${XDG_STATE_HOME:-${HOME}/.local/state}/supersafeedit/"$(\
+	echo ${target_file} | tr / %)"
+if (( "$(echo "${backup_file##*/}" | wc -c)" > 255 )); then
+	echo 'Error! Backup file name exceeded 255 bytes; aborting.'
+	exit 1
+fi
+if [[ -e ${backup_file} ]]; then
+	echo "Error! Backup file already exists: ${backup_file}"
+	exit 1
+fi
+
+mkdir -pv -- "$(dirname -- ${backup_file})"
+
+$([[ -w ${target_file} ]] || echo "${sudo_prog} ")zsh -c "
+
+if [[ -d '${target_file}' ]]; then
+	echo 'The target appears to be an existing non-readable directory.'
+	echo 'Opening editor as root: ${se_editor_prog}'
+	'${se_editor_prog}' -- '${target_file}'
+	exit 2
+else
+	if [[ -e '${target_file}' ]]; then
+		if [[ ! -w '${target_file}' ]]; then
+			echo 'Target file appears to be immutable; removing attribute.'
+			chattr -i -- '${target_file}'
+			target_is_immutable=true
+		fi
+
+		target_permission_info=\"\$(stat -c '%a %u %g' -- '${target_file}')\"
+		target_permission_info=(\${(s/ /)target_permission_info})
+		target_mode=\${target_permission_info[1]}
+		if [[ \${target_permission_info[2]} != \"\$(id -u)\" ]]; then
+			echo Current file owner: \${target_permission_info[2]}:\${target_permission_info[3]}
+			echo 'File not owned by \${USER}; changing ownership.'
+			chown \"\$(id -u)\" -- '${target_file}'
+			target_ownership_altered=true
+		fi
+		if (( \${target_mode[1]} < 6 )); then
+			echo Current file mode: \${target_permission_info}
+			echo 'No write and/or read permissions; changing file mode.'
+			chmod u=rw -- '${target_file}'
+			target_mode_altered=true
+		fi
+
+		echo 'Copying content to backup file: ${backup_file}'
+		cp -- '${target_file}' '${backup_file}'
+		chown -- \"$(id -u)\":\"$(id -g)\" '${backup_file}'
+
+		if [[ \$(id -u) = 0 ]]; then
+			echo 'Opening editor as root: ${se_editor_prog}'
+		else
+			echo 'Opening editor: ${se_editor_prog}'
+		fi
+		'${se_editor_prog}' -- '${target_file}'
+
+		if [[ -e '${target_file}' ]]; then
+			if diff -q -- '${backup_file}' '${target_file}' >/dev/null; then
+				echo 'No apparent changes to the target file were made.'
+			elif command -v colordiff >/dev/null; then
+				colordiff -- '${backup_file}' '${target_file}'
+			else
+				diff -- '${backup_file}' '${target_file}'
+			fi
+		else
+			echo 'Warning! The target file appears to have been removed.'
+			if [[ -e '${backup_file}' ]]; then
+				read 'REPLY?Reinstate it from the backup file? [y/N] '
+				[[ -e '${backup_file}' ]] || exit 3
+				if [[ \${REPLY} = [Yy] ]]; then
+					mv -- '${backup_file}' '${target_file}'
+				else
+					exit 2
+				fi
+			else
+				exit 3
+			fi
+			target_mode_altered=true
+			target_ownership_altered=true
+		fi
+
+		if [[ -n \${target_mode_altered} ]]; then
+			echo 'Reinstating file mode.'
+			chmod \${target_mode} -- '${target_file}'
+		fi
+		if [[ -n \${target_ownership_altered} ]]; then
+			echo 'Reinstating file ownership.'
+			chown \${target_permission_info[2]}:\${target_permission_info[3]} -- '${target_file}'
+		fi
+
+		if [[ -n \${target_is_immutable} ]]; then
+			echo 'Reapplying immutable attribute.'
+			chattr +i -- '${target_file}'
+		fi
+	else
+		echo 'Opening editor as root: ${se_editor_prog}'
+		'${se_editor_prog}' -- '${target_file}'
+		exit 2
+	fi
+fi
+
+"
+
+case $? in
+2) exit 0 ;;
+3)
+	echo 'Warning! The backup file is missing.'
+	exit 1
+	;;
+esac
+
+echo 'All done! Removing backup file.'
+rm -f -- ${backup_file}
+
+exit 0

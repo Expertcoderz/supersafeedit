@@ -1,0 +1,201 @@
+#!/usr/bin/env zsh
+
+# Date Created: 2023-06-23
+# Description: Out-of-place file editing with on-disk temporary file.
+
+# The text editing program to be invoked.
+readonly se_editor_prog=${se_editor_prog-${VISUAL:-${EDITOR:-vi}}}
+
+# Command used for running as root.
+readonly sudo_prog=${sudo_prog-sudo}
+
+# If no filename is supplied, just open the editor and call it a day.
+if [[ -z $1 ]]; then
+	echo "Opening editor: ${se_editor_prog}"
+	${se_editor_prog}
+	exit 0
+fi
+
+# Get the absolute path of the target location to work with.
+# If it resides in a non-readable directory, we have to become root.
+if [[ -r "$(dirname -- $1)" ]]; then
+	target_file="$(realpath -- $1)"
+else
+	target_file="$(${sudo_prog} realpath -- $1)"
+fi
+readonly target_file
+[[ -n ${target_file} ]] || exit 1
+
+# If the target is a (readable) directory, just launch the editor on it directly.
+if [[ -d ${target_file} ]]; then
+	echo "Opening editor: ${se_editor_prog}"
+	${se_editor_prog} -- ${target_file}
+	exit 0
+fi
+
+readonly temp_file=${XDG_STATE_HOME:-${HOME}/.local/state}/supersafeedit/"$(echo \
+	${target_file} | tr / %)"
+if (( "$(echo "${temp_file##*/}" | wc -c)" > 255 )); then
+	echo 'Error! Tempfile name exceeded 255 bytes; aborting.'
+	exit 1
+fi
+if [[ -e ${temp_file} ]]; then
+	echo "Error! Tempfile already exists: ${temp_file}"
+	exit 1
+fi
+
+mkdir -pv -- "$(dirname -- ${temp_file})"
+
+if [[ -r "$(dirname -- ${target_file})" \
+	&& (-r ${target_file} || ! -e ${target_file}) ]]; then
+	if [[ -e ${target_file} ]]; then
+		echo 'Calculating checksum...'
+		sha256sum -- ${target_file} | awk '{print $1}' \
+			>| ${temp_file}.cksum
+		echo "Copying content to tempfile: ${temp_file}"
+		cp -- ${target_file} ${temp_file}
+
+	else
+		# New file in a readable directory.
+		target_file_is_new=true
+	fi
+else
+	# Seems here that the target resides in a non-readable place
+	# or is itself non-readable. Become root to read from it.
+	${sudo_prog} zsh -c "
+	if [[ -d '${target_file}' ]]; then
+		echo 'The target appears to be an existing non-readable directory.'
+		echo 'Opening editor as root: ${se_editor_prog}'
+		'${se_editor_prog}' -- '${target_file}'
+		exit 2
+	else
+		if [[ -e '${target_file}' ]]; then
+			echo 'Calculating checksum...'
+			sha256sum -- '${target_file}' | awk '{print \$1}' >| '${temp_file}.cksum'
+
+			echo 'Copying content to tempfile: ${temp_file}'
+			cp -- '${target_file}' '${temp_file}'
+			chown -- '$(id -u):$(id -g)' '${temp_file}'
+		else
+			# New file in a non-readable directory.
+			exit 3
+		fi
+	fi
+	"
+
+	case $? in
+	2)
+		exit 0
+		;;
+	3)
+		target_file_is_new=true
+		;;
+	esac
+fi
+
+if [[ -n ${target_file_is_new} ]]; then
+	echo "Creating tempfile: ${temp_file}"
+	touch -- ${temp_file}
+fi
+
+echo "Opening editor: $se_editor_prog"
+$se_editor_prog -- ${temp_file}
+
+# Become root if necessary to perform all the post-edit actions.
+# Here we will check for edge cases and determine whether
+# to actually proceed with writing to the target.
+$([[ (-n ${target_file_is_new} && ! -w "$(dirname -- ${target_file})") || \
+	(-z ${target_file_is_new} && ! -w ${target_file}) ]] \
+	&& echo "${sudo_prog} ")zsh -c "
+
+if [[ -e '${target_file}' ]]; then
+	if [[ -d '${target_file}' ]]; then
+		echo 'Whoopsy daisy! The target appears to have unexpectedly become a directory.'
+		echo 'No changes will be made to the target; the tempfile will be preserved.'
+		exit 1
+	fi
+
+	if [[ -n '${target_file_is_new}' ]]; then
+		echo 'Warning! A new file appears to have taken the target location while editing: ${target_file}'
+		read 'REPLY?Continue and overwrite it anyway? [Y/n] '
+		if [[ \${REPLY} =~ [Nn] ]]; then
+			echo 'No changes will be made to the target; the tempfile will be preserved.'
+			exit 1
+		fi
+	fi
+
+	if [[ -e '${temp_file}.cksum' ]]; then
+		if [[ \"\$(sha256sum -- '${target_file}' | awk '{print \$1}')\" != \"\$(<'${temp_file}.cksum')\" ]]; then
+			echo 'Warning! The target file appears to have been altered by other means since it was opened.'
+			read 'REPLY?Continue and overwrite it anyway? [Y/n] '
+			if [[ \${REPLY} =~ [Nn] ]]; then
+				echo 'No changes will be made to the target; the tempfile will be preserved.'
+				exit 1
+			fi
+		fi
+	else
+		echo 'Warning! The checksum temporary reference file appears to be missing: ${temp_file}.cksum'
+	fi
+
+	if diff -q -- '${target_file}' '${temp_file}' >/dev/null; then
+		echo 'No changes detected. The target file remains unaltered.'
+		exit 0
+	elif command -v colordiff >/dev/null; then
+		colordiff -- '${target_file}' '${temp_file}'
+	else
+		diff -- '${target_file}' '${temp_file}'
+	fi
+
+	if [[ ! -w '${target_file}' ]]; then
+		echo 'Target file appears to be immutable; removing attribute.'
+		\$([[ \$(id -u) != 0 ]] && echo '${sudo_prog} ')chattr -i -- '${target_file}'
+		target_file_is_immutable=true
+
+		if [[ ! -w '${target_file}' ]]; then
+			echo 'Error! Target is still unwritable.'
+			echo 'No changes will be made to the target; the tempfile will be preserved.'
+			exit 1
+		fi
+	fi
+else
+	if [[ -n '${target_file_is_new}' ]]; then
+		if [[ ! -s '${temp_file}' ]]; then
+			echo 'The tempfile appears to have been left empty.'
+			read 'REPLY?Create a new empty file as the target? [y/N] '
+			if [[ \${REPLY} =~ [Yy] ]]; then
+				touch -- '${target_file}'
+			else
+				echo 'No changes made.'
+			fi
+			exit 0
+		fi
+	else
+		echo 'Warning! The target file now appears to be missing.'
+		read 'REPLY?Proceed to write anyway? [Y/n] '
+		if [[ \${REPLY} =~ [Nn] ]]; then
+			echo 'No changes will be made to the target; the tempfile will be preserved.'
+			exit 1
+		fi
+	fi
+fi
+
+echo 'Writing new content to target: ${target_file}'
+cp -f -- '${temp_file}' '${target_file}'
+
+if [[ -n \${target_file_is_immutable} ]]; then
+	echo 'Reapplying immutable attribute.'
+	\$([[ \$(id -u) != 0 ]] && echo '${sudo_prog} ')chattr +i -- '${target_file}'
+fi
+
+"
+
+case $? in
+0)
+	echo 'All done! Removing tempfile.'
+	rm -f -- ${temp_file}
+	rm -f -- ${temp_file}.cksum
+;;
+*) exit 1 ;;
+esac
+
+exit 0
